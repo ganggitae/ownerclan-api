@@ -576,3 +576,9 @@ def privacy():
 @app.get("/")
 def root():
     return {"ok": True, "message": "Ownerclan Similar Finder API is running. Use /search."}
+
+from fastapi.responses import JSONResponse
+
+@app.get("/")
+def root():
+    return JSONResponse({"ok": True, "message": "Ownerclan Similar Finder API is running. Use /search."})
