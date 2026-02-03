@@ -1,376 +1,497 @@
-import asyncio
+import os
 import re
-from dataclasses import dataclass
-from io import BytesIO
-from typing import List, Optional, Dict, Tuple
-from urllib.parse import urljoin, urlparse
+import csv
+import io
+import time
+from typing import List, Optional, Dict, Any, Tuple
+from urllib.parse import urlparse, parse_qs, quote_plus
 
-import httpx
+import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
-
 from PIL import Image
 import imagehash
 
+app = FastAPI(title="Ownerclan Similar Finder API", version="1.0")
 
-app = FastAPI(title="Ownerclan Similar Finder API", version="1.1")
+# -----------------------------
+# Config
+# -----------------------------
+DEFAULT_TIMEOUT = 12
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/121.0.0.0 Safari/537.36"
+)
+
+# Railway/Render 등에서 프록시 뒤일 때도 잘 돌게끔
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": UA})
+
+# 마지막 CSV를 /download/result.csv 로 내려주기 위한 메모리 저장
+LAST_CSV_BYTES: bytes = b""
+LAST_CSV_TS: float = 0.0
 
 
 # -----------------------------
-# Request Schema
+# Request schema
 # -----------------------------
 class SearchReq(BaseModel):
     url: str
     top_pages: int = 20
-    mode: str = "main_only"  # "main_only" or "main+detail"
+    mode: str = "main_only"  # "main_only" | "main+detail"
     seed_search_urls: Optional[List[str]] = []
-
-    phash_threshold: int = Field(default=10, ge=0, le=32)
-    max_candidates: int = Field(default=80, ge=10, le=500)
-    only_first_image: bool = Field(default=False)  # 대표이미지 1장 우선모드
+    phash_threshold: int = Field(default=10, ge=0, le=32)   # 낮을수록 엄격
+    max_candidates: int = Field(default=80, ge=10, le=500)  # 후보 최대
+    only_first_image: bool = False  # True면 후보/시드 모두 첫 이미지 1장만 비교
 
 
 # -----------------------------
 # Utilities
 # -----------------------------
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
-)
+def _clean_text(s: str) -> str:
+    s = re.sub(r"\s+", " ", s or "").strip()
+    return s
 
-IMG_EXT_RE = re.compile(r"\.(jpg|jpeg|png|webp)(\?|$)", re.IGNORECASE)
 
-# 상세페이지와 무관한 이미지 후보를 거르는 강한 필터(경험적으로 흔한 패턴)
-BAD_PATH_HINTS = [
-    "logo", "icon", "sprite", "banner", "bn_", "btn", "button",
-    "header", "footer", "top", "bottom", "gnb", "lnb", "aside",
-    "common", "layout", "nav", "menu", "arrow",
-    "bg", "background", "line", "bullet",
-]
+def _is_ownerclan_product_url(u: str) -> bool:
+    return "ownerclan.com" in u and "/V2/product/view.php" in u and "selfcode=" in u
 
-def is_probably_bad_image(url: str) -> bool:
-    u = url.lower()
-    return any(h in u for h in BAD_PATH_HINTS)
 
-def normalize_abs_url(base_url: str, src: str) -> str:
-    return urljoin(base_url, src.strip())
-
-def domain(url: str) -> str:
+def _extract_selfcode(u: str) -> Optional[str]:
     try:
-        return urlparse(url).netloc.lower()
+        q = parse_qs(urlparse(u).query)
+        sc = q.get("selfcode", [None])[0]
+        return sc
     except Exception:
+        return None
+
+
+def _absolute_url(base: str, href: str) -> str:
+    if not href:
         return ""
+    if href.startswith("http://") or href.startswith("https://"):
+        return href
+    if href.startswith("//"):
+        return "https:" + href
+    # relative
+    p = urlparse(base)
+    return f"{p.scheme}://{p.netloc}{href if href.startswith('/') else '/' + href}"
 
-@dataclass
-class ImgInfo:
-    url: str
-    phash: Optional[str] = None
-    width: Optional[int] = None
-    height: Optional[int] = None
 
-
-# 간단 메모리 캐시 (속도 2~3배 튜닝 핵심 1)
-_PHASH_CACHE: Dict[str, Tuple[str, int, int]] = {}  # img_url -> (phash, w, h)
-
-# -----------------------------
-# Network / Image Hash
-# -----------------------------
-async def fetch_text(client: httpx.AsyncClient, url: str) -> str:
-    r = await client.get(url, follow_redirects=True, timeout=20)
+def fetch_html(url: str) -> str:
+    r = SESSION.get(url, timeout=DEFAULT_TIMEOUT)
     r.raise_for_status()
     return r.text
 
-async def fetch_bytes(client: httpx.AsyncClient, url: str) -> bytes:
-    r = await client.get(url, follow_redirects=True, timeout=25)
-    r.raise_for_status()
-    return r.content
 
-async def compute_phash(client: httpx.AsyncClient, img_url: str) -> Optional[Tuple[str, int, int]]:
-    if img_url in _PHASH_CACHE:
-        return _PHASH_CACHE[img_url]
-
-    # 이미지 확장자 아닌 것(또는 너무 수상한 것)은 스킵
-    if not IMG_EXT_RE.search(img_url):
-        return None
-
+def try_fetch_json(url: str) -> Optional[Dict[str, Any]]:
     try:
-        raw = await fetch_bytes(client, img_url)
-        im = Image.open(BytesIO(raw)).convert("RGB")
-        w, h = im.size
-
-        # 너무 작은 이미지는 로고/아이콘일 확률이 높아서 제거 (필터 핵심)
-        if w < 250 or h < 250:
+        r = SESSION.get(url, timeout=DEFAULT_TIMEOUT)
+        if r.status_code != 200:
             return None
-
-        ph = str(imagehash.phash(im))
-        _PHASH_CACHE[img_url] = (ph, w, h)
-        return ph, w, h
+        return r.json()
     except Exception:
         return None
 
-def phash_distance(h1: str, h2: str) -> int:
-    # imagehash는 hex string 기반이라, 다시 객체로 변환해 distance
-    return int(imagehash.hex_to_hash(h1) - imagehash.hex_to_hash(h2))
 
-
-# -----------------------------
-# HTML Parsing: "상품 이미지"만 추출
-# -----------------------------
-def extract_candidate_images_from_html(page_url: str, html: str) -> List[str]:
+def parse_product_page(url: str) -> Dict[str, Any]:
     """
-    목표:
-    - 상세페이지에서 "상품이미지로 보이는 것"만 추출
-    - 로고/배너/아이콘/푸터/공통 이미지 최대한 제거
-    전략:
-    1) img 태그 src/data-src 모두 수집
-    2) 절대URL 변환 + 도메인 기준 정리
-    3) 경로 힌트/작은 이미지 제외
-    4) 중복 제거
+    Returns:
+      {
+        "title": str,
+        "images": [url1, url2, ...],
+        "selfcode": str|None
+      }
     """
+    html = fetch_html(url)
     soup = BeautifulSoup(html, "lxml")
-    imgs = []
 
-    for img in soup.find_all("img"):
+    # title 우선순위: og:title -> title tag -> h1
+    title = ""
+    og_title = soup.select_one('meta[property="og:title"]')
+    if og_title and og_title.get("content"):
+        title = _clean_text(og_title["content"])
+
+    if not title:
+        t = soup.select_one("title")
+        if t:
+            title = _clean_text(t.get_text())
+
+    if not title:
+        h1 = soup.select_one("h1")
+        if h1:
+            title = _clean_text(h1.get_text())
+
+    # 이미지 수집 우선순위:
+    # 1) og:image
+    # 2) img 태그 중 상품 영역에서 많이 나오는 것들
+    images = []
+
+    og_img = soup.select_one('meta[property="og:image"]')
+    if og_img and og_img.get("content"):
+        images.append(_absolute_url(url, og_img["content"]))
+
+    # img 태그에서 후보 찾기 (너무 잡다한 아이콘 제외)
+    for img in soup.select("img"):
         src = img.get("src") or img.get("data-src") or img.get("data-original")
         if not src:
             continue
-
-        absu = normalize_abs_url(page_url, src)
-
-        # 상세페이지와 관계 없는 외부 CDN/광고 이미지가 많으면 여기서 도메인 필터도 가능
-        # (너무 빡세면 상품이미지도 날릴 수 있어 우선은 약하게)
-        if is_probably_bad_image(absu):
+        absu = _absolute_url(url, src)
+        if "favicon" in absu.lower():
             continue
-
-        imgs.append(absu)
+        # 너무 작은 아이콘/스프라이트 추정 제외
+        if any(x in absu.lower() for x in ["icon", "sprite", "loading"]):
+            continue
+        # 오너클랜 이미지 CDN/경로에 자주 들어가는 키워드 가중
+        if "image" in absu.lower() or "img" in absu.lower() or "product" in absu.lower():
+            images.append(absu)
 
     # 중복 제거(순서 유지)
+    dedup = []
     seen = set()
-    out = []
-    for u in imgs:
-        if u in seen:
-            continue
-        seen.add(u)
-        out.append(u)
+    for im in images:
+        if im and im not in seen:
+            seen.add(im)
+            dedup.append(im)
 
-    return out
-
-
-# -----------------------------
-# Main Logic
-# -----------------------------
-async def get_main_product_images(client: httpx.AsyncClient, product_url: str, only_first: bool) -> List[ImgInfo]:
-    html = await fetch_text(client, product_url)
-    urls = extract_candidate_images_from_html(product_url, html)
-
-    # 대표이미지 1장 우선 모드
-    if only_first and urls:
-        urls = urls[:1]
-
-    # phash 병렬 계산 (속도 2~3배 튜닝 핵심 2: 동시 처리)
-    tasks = [compute_phash(client, u) for u in urls]
-    results = await asyncio.gather(*tasks)
-
-    img_infos: List[ImgInfo] = []
-    for u, r in zip(urls, results):
-        if not r:
-            continue
-        ph, w, h = r
-        img_infos.append(ImgInfo(url=u, phash=ph, width=w, height=h))
-
-    return img_infos
-
-
-async def get_candidate_product_pages_from_seed(client: httpx.AsyncClient, seed_urls: List[str], limit: int) -> List[str]:
-    """
-    seed_search_urls 는 사용자가 직접 넣어주는 '검색결과 페이지 URL' 혹은 '카테고리/리스트 페이지 URL'
-    여기서 상세상품 링크들을 추출합니다.
-    """
-    product_links: List[str] = []
-    seen = set()
-
-    for s_url in seed_urls:
-        try:
-            html = await fetch_text(client, s_url)
-        except Exception:
-            continue
-
-        soup = BeautifulSoup(html, "lxml")
-        # ownerclan은 /V2/product/view.php?selfcode=... 형태가 핵심
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if "product/view.php" not in href:
-                continue
-            absu = normalize_abs_url(s_url, href)
-            if absu in seen:
-                continue
-            seen.add(absu)
-            product_links.append(absu)
-            if len(product_links) >= limit:
-                return product_links
-
-    return product_links
-
-
-async def score_candidate_by_images(
-    client: httpx.AsyncClient,
-    query_imgs: List[ImgInfo],
-    candidate_url: str,
-    phash_threshold: int,
-    mode: str
-) -> Optional[Dict]:
-    """
-    후보 상품 상세페이지에서 이미지 추출 → query 이미지와 phash 비교 → 최소 거리(가까울수록 유사)
-    """
-    try:
-        html = await fetch_text(client, candidate_url)
-    except Exception:
-        return None
-
-    cand_img_urls = extract_candidate_images_from_html(candidate_url, html)
-
-    # mode에 따라 이미지 수를 제한(속도 튜닝)
-    # - main_only: 앞에서 1~3장 정도만 빠르게 검사
-    # - main+detail: 더 많이 검사
-    if mode == "main_only":
-        cand_img_urls = cand_img_urls[:3]
-    else:
-        cand_img_urls = cand_img_urls[:10]
-
-    # 후보 이미지 phash 계산
-    tasks = [compute_phash(client, u) for u in cand_img_urls]
-    ph_results = await asyncio.gather(*tasks)
-
-    cand_hashes = []
-    for u, r in zip(cand_img_urls, ph_results):
-        if not r:
-            continue
-        ph, w, h = r
-        cand_hashes.append((u, ph))
-
-    if not cand_hashes or not query_imgs:
-        return None
-
-    # query_imgs vs cand_hashes 최소 거리 계산
-    best = None  # (dist, q_img_url, c_img_url)
-    for qi in query_imgs:
-        for cu, ch in cand_hashes:
-            dist = phash_distance(qi.phash, ch)
-            if best is None or dist < best[0]:
-                best = (dist, qi.url, cu)
-
-    if best is None:
-        return None
-
-    dist, qimg, cimg = best
-    # threshold 이내만 유사로 판단
-    if dist > phash_threshold:
-        return None
-
-    # 가격/배송비/총액은 "일반가 기준"으로 잡아야 하므로
-    # 실제 파싱은 사이트 구조 확정 후 구현(지금은 빈 값으로 두고, GPT 출력에서 정렬은 total_price가 있으면 적용)
     return {
-        "product_url": candidate_url,
-        "match_distance": dist,
-        "match_query_image": qimg,
-        "match_candidate_image": cimg,
-        "price": None,
-        "shipping": None,
-        "total_price": None,
+        "title": title,
+        "images": dedup,
+        "selfcode": _extract_selfcode(url),
     }
 
 
+def build_search_urls(keyword: str, page: int) -> List[str]:
+    """
+    오너클랜이 UI/버전에 따라 검색 URL이 달라질 수 있어서 여러 패턴을 동시에 시도한다.
+    """
+    kw = quote_plus(keyword)
+
+    # 패턴1: /V2/search/search.php 형태(추정)
+    u1 = f"https://www.ownerclan.com/V2/search/search.php?topSearchKeyword={kw}&topSearchType=all&page={page}"
+
+    # 패턴2: /V2/search/ + query 형태(추정)
+    u2 = f"https://www.ownerclan.com/V2/search/?topSearchKeyword={kw}&topSearchType=all&page={page}"
+
+    # 패턴3: /V2/product/search.php 형태(추정)
+    u3 = f"https://www.ownerclan.com/V2/product/search.php?topSearchKeyword={kw}&topSearchType=all&page={page}"
+
+    return [u1, u2, u3]
+
+
+def parse_product_links_from_search(html: str) -> List[str]:
+    soup = BeautifulSoup(html, "lxml")
+    links = []
+    for a in soup.select("a[href]"):
+        href = a.get("href", "")
+        if "/V2/product/view.php" in href and "selfcode=" in href:
+            links.append(_absolute_url("https://www.ownerclan.com", href))
+
+    # 중복 제거
+    out = []
+    seen = set()
+    for u in links:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def download_image_bytes(url: str) -> Optional[bytes]:
+    try:
+        r = SESSION.get(url, timeout=DEFAULT_TIMEOUT)
+        if r.status_code != 200:
+            return None
+        return r.content
+    except Exception:
+        return None
+
+
+def phash_from_bytes(b: bytes) -> Optional[imagehash.ImageHash]:
+    try:
+        im = Image.open(io.BytesIO(b))
+        # 투명/팔레트 경고 방지용 변환
+        im = im.convert("RGBA")
+        return imagehash.phash(im)
+    except Exception:
+        return None
+
+
+def collect_seed_images(seed_url: str, mode: str, only_first: bool) -> Tuple[str, List[str]]:
+    info = parse_product_page(seed_url)
+    title = info["title"] or ""
+    imgs = info["images"] or []
+
+    if mode == "main_only":
+        imgs = imgs[:1]
+    else:
+        # main+detail 모드일 때도 너무 많으면 과부하 나므로 상한
+        imgs = imgs[:12]
+
+    if only_first:
+        imgs = imgs[:1]
+
+    return title, imgs
+
+
+def collect_candidate_urls_by_keyword(keyword: str, top_pages: int, max_candidates: int) -> List[str]:
+    """
+    여러 검색 URL 패턴을 시도하면서 후보 URL을 모은다.
+    """
+    candidates = []
+    seen = set()
+
+    for page in range(1, max(1, top_pages) + 1):
+        urls = build_search_urls(keyword, page)
+        page_links: List[str] = []
+
+        for su in urls:
+            try:
+                html = fetch_html(su)
+                links = parse_product_links_from_search(html)
+                if links:
+                    page_links.extend(links)
+            except Exception:
+                continue
+
+        for u in page_links:
+            if u not in seen:
+                seen.add(u)
+                candidates.append(u)
+                if len(candidates) >= max_candidates:
+                    return candidates
+
+        # 너무 빠르게 긁으면 차단될 수 있어 약간 쉬기
+        time.sleep(0.15)
+
+    return candidates
+
+
+def compare_and_rank(
+    seed_imgs: List[str],
+    candidate_urls: List[str],
+    phash_threshold: int,
+    only_first: bool,
+    mode: str,
+    seed_url: str,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    seed 이미지들과 candidate 상품 이미지들을 pHash로 비교해 결과를 만든다.
+    """
+    # seed phash 준비
+    seed_hashes = []
+    seed_hash_map = {}  # seed_img_url -> hash
+    for s in seed_imgs:
+        b = download_image_bytes(s)
+        if not b:
+            continue
+        h = phash_from_bytes(b)
+        if h is None:
+            continue
+        seed_hashes.append((s, h))
+        seed_hash_map[s] = h
+
+    results = []
+    scanned = 0
+
+    for cu in candidate_urls:
+        if cu == seed_url:
+            continue
+        # selfcode 같은 상품 제외
+        if _extract_selfcode(cu) == _extract_selfcode(seed_url):
+            continue
+
+        scanned += 1
+        try:
+            pinfo = parse_product_page(cu)
+            cimgs = pinfo["images"] or []
+            if mode == "main_only":
+                cimgs = cimgs[:1]
+            else:
+                cimgs = cimgs[:10]
+            if only_first:
+                cimgs = cimgs[:1]
+
+            best = None  # (dist, seed_img, cand_img)
+            for cimg in cimgs:
+                cb = download_image_bytes(cimg)
+                if not cb:
+                    continue
+                ch = phash_from_bytes(cb)
+                if ch is None:
+                    continue
+
+                for s_img, s_h in seed_hashes:
+                    dist = (s_h - ch)
+                    if best is None or dist < best[0]:
+                        best = (dist, s_img, cimg)
+
+            if best and best[0] <= phash_threshold:
+                results.append(
+                    {
+                        "candidate_url": cu,
+                        "candidate_title": pinfo.get("title", ""),
+                        "best_distance": int(best[0]),
+                        "matched_seed_image": best[1],
+                        "matched_candidate_image": best[2],
+                    }
+                )
+        except Exception:
+            continue
+
+        # 과부하 방지
+        if scanned % 10 == 0:
+            time.sleep(0.2)
+
+    # best_distance 오름차순 정렬
+    results.sort(key=lambda x: x.get("best_distance", 999))
+
+    debug = {
+        "seed_image_count": len(seed_hashes),
+        "candidate_count_scanned": scanned,
+        "phash_threshold": phash_threshold,
+    }
+    return results, debug
+
+
+def make_csv_bytes(seed_url: str, seed_title: str, results: List[Dict[str, Any]]) -> bytes:
+    output = io.StringIO()
+    w = csv.writer(output)
+    w.writerow(["seed_url", "seed_title", "candidate_url", "candidate_title", "best_distance", "matched_seed_image", "matched_candidate_image"])
+    for r in results:
+        w.writerow([
+            seed_url,
+            seed_title,
+            r.get("candidate_url", ""),
+            r.get("candidate_title", ""),
+            r.get("best_distance", ""),
+            r.get("matched_seed_image", ""),
+            r.get("matched_candidate_image", ""),
+        ])
+    return output.getvalue().encode("utf-8-sig")
+
+
+# -----------------------------
+# API endpoints
+# -----------------------------
+@app.get("/", response_class=HTMLResponse)
+def root():
+    return """
+    <h2>Ownerclan Similar Finder API</h2>
+    <ul>
+      <li>GET /openapi.json</li>
+      <li>POST /search</li>
+      <li>POST /export_csv</li>
+      <li>GET /download/result.csv</li>
+      <li>GET /privacy</li>
+    </ul>
+    """
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
 @app.post("/search")
-async def search(req: SearchReq):
-    """
-    동작:
-    1) 입력 상품 URL에서 '상품 이미지'만 필터링 추출 (로고/아이콘/배너 제외)
-    2) 대표이미지 1장 우선 모드(옵션)
-    3) seed_search_urls 로 준 검색/리스트 페이지에서 후보 상품 링크 추출
-    4) 후보 상품 이미지와 phash 유사도 비교 → threshold 이내만 결과로 반환
-    """
-    async with httpx.AsyncClient(headers={"User-Agent": UA}) as client:
-        query_imgs = await get_main_product_images(client, req.url, req.only_first_image)
+def search(req: SearchReq):
+    # 1) seed 이미지/타이틀
+    seed_title, seed_imgs = collect_seed_images(req.url, req.mode, req.only_first_image)
 
-        # seed가 없으면 유사상품 탐색이 불가능 → 이미지 추출까지만 확인해주고 종료
-        if not req.seed_search_urls:
-            return JSONResponse({
-                "ok": True,
-                "status": "connected",
-                "query_url": req.url,
-                "mode": req.mode,
-                "only_first_image": req.only_first_image,
-                "extracted_query_images": [i.url for i in query_imgs],
-                "hint": "seed_search_urls(검색결과/리스트 페이지 URL)을 넣으면 후보 상품을 찾아 유사도 비교를 수행합니다."
-            })
+    # 2) 후보 URL 수집 (A: 상품명 기반 검색)
+    keyword = seed_title
+    # 너무 길면 검색이 깨질 수 있어 일부만
+    keyword = _clean_text(keyword)[:60] if keyword else ""
 
-        candidate_pages = await get_candidate_product_pages_from_seed(
-            client,
-            req.seed_search_urls,
-            limit=req.max_candidates
-        )
+    candidates = []
+    if keyword:
+        candidates = collect_candidate_urls_by_keyword(keyword, req.top_pages, req.max_candidates)
 
-        # 후보를 병렬로 점수화(속도 튜닝 핵심 3)
-        tasks = [
-            score_candidate_by_images(client, query_imgs, cu, req.phash_threshold, req.mode)
-            for cu in candidate_pages
-        ]
-        scored = await asyncio.gather(*tasks)
-        results = [r for r in scored if r]
+    # 3) seed_search_urls가 있으면 후보에 합치기
+    if req.seed_search_urls:
+        for u in req.seed_search_urls:
+            if u and _is_ownerclan_product_url(u) and u not in candidates:
+                candidates.append(u)
+                if len(candidates) >= req.max_candidates:
+                    break
 
-        # 정렬 규칙:
-        # 1) total_price(가격+배송비)가 있으면 total_price 오름차순
-        # 2) 없으면 match_distance(유사도) 오름차순
-        def sort_key(x):
-            tp = x.get("total_price")
-            if tp is None:
-                return (10**9, x.get("match_distance", 999))
-            return (tp, x.get("match_distance", 999))
+    # 4) 비교
+    results, debug = compare_and_rank(
+        seed_imgs=seed_imgs,
+        candidate_urls=candidates,
+        phash_threshold=req.phash_threshold,
+        only_first=req.only_first_image,
+        mode=req.mode,
+        seed_url=req.url,
+    )
 
-        results.sort(key=sort_key)
+    payload = {
+        "query_url": req.url,
+        "seed_title": seed_title,
+        "keyword_used": keyword,
+        "mode": req.mode,
+        "top_pages": req.top_pages,
+        "phash_threshold": req.phash_threshold,
+        "max_candidates": req.max_candidates,
+        "seed_images_used": seed_imgs[: (1 if req.only_first_image else len(seed_imgs))],
+        "candidate_urls_collected": len(candidates),
+        "result_count": len(results),
+        "results": results,
+        "status": "ok",
+        "debug": debug,
+    }
 
-        return {
-            "ok": True,
-            "status": "ok",
-            "query_url": req.url,
-            "mode": req.mode,
-            "only_first_image": req.only_first_image,
-            "extracted_query_images": [i.url for i in query_imgs],
-            "candidates_checked": len(candidate_pages),
-            "results_count": len(results),
-            "results": results[: req.max_candidates],
-        }
+    # CSV 준비(검색 때마다 최신으로 갱신)
+    global LAST_CSV_BYTES, LAST_CSV_TS
+    LAST_CSV_BYTES = make_csv_bytes(req.url, seed_title, results)
+    LAST_CSV_TS = time.time()
+
+    return JSONResponse(payload)
 
 
 @app.post("/export_csv")
-async def export_csv(req: SearchReq):
-    # 현재는 download_url만 제공 (다음 단계에서 results를 서버 메모리/스토리지에 저장 후 CSV 생성)
-    return {"ok": True, "download_url": "/download/result.csv", "status": "connected"}
+def export_csv(req: SearchReq):
+    """
+    export_csv는 내부적으로 /search를 한 번 실행해서 최신 결과 CSV를 만든 뒤,
+    download_url을 돌려준다.
+    """
+    _ = search(req)  # 최신 결과 생성 (LAST_CSV_BYTES 갱신)
+    return {
+        "ok": True,
+        "download_url": "/download/result.csv",
+        "note": "Open /download/result.csv to download the latest CSV result."
+    }
 
 
-@app.get("/download/result.csv", response_class=PlainTextResponse)
+@app.get("/download/result.csv")
 def download_csv():
-    # 임시 CSV (다음 단계에서 실제 결과 저장/다운로드 구현)
-    return "rank,product_url,match_distance,price,shipping,total_price\n"
+    if not LAST_CSV_BYTES:
+        return Response(content="No CSV generated yet. Call POST /search first.", media_type="text/plain", status_code=400)
+    return Response(
+        content=LAST_CSV_BYTES,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=result.csv"},
+    )
 
 
 @app.get("/privacy", response_class=HTMLResponse)
 def privacy():
     return """
     <h1>Privacy Policy</h1>
-    <p>No personal data is stored. This service only processes user-provided URLs for similarity search.</p>
+    <p>This service processes user-provided URLs to fetch publicly available web pages and images for similarity comparison.</p>
+    <p>No personal data is intentionally collected. Search results may be temporarily stored in memory to generate CSV downloads.</p>
     """
 
 
-@app.get("/", response_class=HTMLResponse)
-def root():
-    return """
-    <h2>Ownerclan Similar Finder API</h2>
-    <ul>
-      <li>GET <a href="/privacy">/privacy</a></li>
-      <li>GET <a href="/docs">/docs</a> (Swagger)</li>
-      <li>GET <a href="/openapi.json">/openapi.json</a></li>
-    </ul>
-    """
+# -----------------------------
+# Uvicorn entry (Railway)
+# -----------------------------
+# Railway는 PORT 환경변수를 주는 경우가 많음.
+# Procfile 없이도 실행되게 해둠.
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
